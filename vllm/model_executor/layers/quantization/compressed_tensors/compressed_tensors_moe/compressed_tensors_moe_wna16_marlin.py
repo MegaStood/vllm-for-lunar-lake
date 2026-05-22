@@ -323,6 +323,75 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         num_experts = layer.w13_weight_g_idx.shape[0]
         device = layer.w13_weight_g_idx.device
+
+        # === XPU INT4 MoE patch (ported from v19, ~/v19-patches/, 2026-05-20) ===
+        # Upstream uses CUDA-only gptq_marlin_moe_repack + marlin_moe_permute_scales,
+        # absent on XPU. Convert int32-packed [E,K/8,2N] -> uint8 2's-complement
+        # [E,2N,K/2], scales -> [E,2N,K/GS], and route apply() through
+        # cutlass_grouped_gemm_interface (xpu_fused_moe, is_int4=True; vllm-xpu-kernels).
+        from vllm.platforms import current_platform
+
+        if (
+            current_platform.is_xpu()
+            and self.num_bits == 4
+            and self.kernel_backend == "Marlin"
+        ):
+            device = layer.w13_weight_packed.device
+
+            def gptq_to_xpu_int4(qw_i32):
+                # raw-u4 pack (zp=8 implicit); xpu_fused_moe does implement_zp.
+                u32 = qw_i32.to(torch.int64) & 0xFFFFFFFF
+                nibs = torch.stack(
+                    [((u32 >> (p * 4)) & 0xF).to(torch.uint8) for p in range(8)],
+                    dim=2,
+                )
+                E = qw_i32.shape[0]
+                N = qw_i32.shape[-1]
+                unpacked = nibs.reshape(E, -1, N)  # [E, K, N]
+                int4_nk = unpacked.permute(0, 2, 1).contiguous()  # [E, N, K]
+                lo = int4_nk[..., 0::2]
+                hi = int4_nk[..., 1::2]
+                return (lo | (hi << 4)).to(torch.uint8)
+
+            w13_cpu = layer.w13_weight_packed.detach().cpu()
+            w2_cpu = layer.w2_weight_packed.detach().cpu()
+            s13_cpu = (
+                layer.w13_weight_scale.detach().cpu().permute(0, 2, 1).contiguous()
+            )
+            s2_cpu = (
+                layer.w2_weight_scale.detach().cpu().permute(0, 2, 1).contiguous()
+            )
+
+            layer.w13_weight_packed.data = torch.empty(
+                0, dtype=torch.int32, device=device
+            )
+            layer.w2_weight_packed.data = torch.empty(
+                0, dtype=torch.int32, device=device
+            )
+            layer.w13_weight_scale.data = torch.empty(
+                0, dtype=layer.w13_weight_scale.dtype, device=device
+            )
+            layer.w2_weight_scale.data = torch.empty(
+                0, dtype=layer.w2_weight_scale.dtype, device=device
+            )
+            torch.xpu.empty_cache()
+
+            w13_packed = gptq_to_xpu_int4(w13_cpu)
+            w2_packed = gptq_to_xpu_int4(w2_cpu)
+            del w13_cpu, w2_cpu
+
+            layer.xpu_w13 = w13_packed.to(device); del w13_packed
+            layer.xpu_w2 = w2_packed.to(device); del w2_packed
+            layer.xpu_s13 = s13_cpu.to(device); del s13_cpu
+            layer.xpu_s2 = s2_cpu.to(device); del s2_cpu
+            torch.xpu.empty_cache()
+
+            layer.xpu_int4_num_experts = num_experts
+            layer.xpu_int4_group_size = self.group_size
+            layer.xpu_int4_ready = True
+            return
+        # === end XPU INT4 MoE patch ===
+
         if self.kernel_backend == "Flashinfer":
             dict_weights_mxint4 = prepare_static_weights_for_trtllm_mxint4_moe(
                 layer.w13_weight_packed,
@@ -547,6 +616,10 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
         assert self.kernel_backend == "Marlin"
+        # === XPU INT4 MoE patch (ported from v19, 2026-05-20) ===
+        if getattr(layer, "xpu_int4_ready", False):
+            return self._apply_xpu_int4(layer, x, topk_weights, topk_ids)
+        # === end XPU INT4 MoE patch ===
         return fused_marlin_moe(
             x,
             layer.w13_weight_packed,
@@ -573,3 +646,25 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             is_k_full=self.is_k_full,
             inplace=not self.moe.disable_inplace,
         )
+
+    # === XPU INT4 MoE patch (ported from v19, ~/v19-patches/, 2026-05-20) ===
+    def _apply_xpu_int4(self, layer, x, topk_weights, topk_ids):
+        # XPU INT4 MoE via vllm_xpu_kernels.xpu_fused_moe(is_int4=True).
+        from vllm_xpu_kernels.fused_moe_interface import xpu_fused_moe
+
+        return xpu_fused_moe(
+            hidden_states=x,
+            w13=layer.xpu_w13,
+            w13_scales=layer.xpu_s13,
+            w13_bias=None,
+            w2=layer.xpu_w2,
+            w2_scales=layer.xpu_s2,
+            w2_bias=None,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            n_experts_per_token=topk_ids.shape[-1],
+            activation="silu",
+            num_experts=layer.xpu_int4_num_experts,
+            is_int4=True,
+        )
+    # === end XPU INT4 MoE patch ===

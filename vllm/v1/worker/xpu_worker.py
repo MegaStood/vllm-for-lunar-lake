@@ -86,8 +86,15 @@ class XPUWorker(Worker):
         )
 
         # global all_reduce needed for overall oneccl warm up
-        if torch.distributed.is_xccl_available():
+        # === XPU patch (2026-05-20): skip warmup all_reduce for single-GPU ===
+        # The warmup triggers XCCL coll_init -> SYCL JIT -> intermittent
+        # urProgramBuildExp/__strlen_avx2 segfault on Lunar Lake. For TP=1 /
+        # world_size==1 there are no real collectives, so the warmup is
+        # unnecessary. Skip it when single-GPU.
+        _ws = getattr(self.parallel_config, "world_size", 1)
+        if torch.distributed.is_xccl_available() and _ws > 1:
             torch.distributed.all_reduce(torch.zeros(1).xpu())
+        # === end XPU patch ===
 
         # Set random seed.
         set_random_seed(self.model_config.seed)
