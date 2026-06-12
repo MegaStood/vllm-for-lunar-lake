@@ -20,7 +20,7 @@ the v0.21 path could not handle their non-256-aligned tensor shapes.
 | **Nemotron-3-Nano-30B-A3B-AWQ** | compressed-tensors WNA16 sym-INT4 | XPU (CUTLASS-SYCL) | hybrid Mamba2+attn, primary OpenClaw daily driver. Warm prefill 1673 tok/s, decode 22 tok/s at 7K. |
 | **LFM2-24B-A2B** | compressed-tensors WNA16 sym-INT4 | XPU (CUTLASS-SYCL) | flat decode across full 32K (22→17 tok/s), no decode-wall |
 | **LFM2.5-8B FP8** | per-channel FP8 (compressed-tensors) | Triton fallback | reasoning model — emits `<think>` blocks |
-| **Gemma 4 26B QAT** | W4A16 compressed-tensors | **TRITON fallback** (XPUExpertsInt4 rejects GELU_TANH) | drafter-spec model also available; serves but limited by `TRITON_ATTN` head-dim issue (#38887) |
+| **Gemma 4 26B QAT** | W4A16 compressed-tensors | **TRITON fallback** (XPUExpertsInt4 rejects GELU_TANH) | drafter-spec model also available; PR #38891 vendored in this branch unblocks per-layer FlashAttention (~83% of layers — see patch 5) |
 | **GLM-4.7-Flash** | compressed-tensors | XPU | needs MLA `kv_b_proj` quantized-dtype fix (same as v0.21 fork's GLM patch — applied to the equivalent file) |
 | **Qwen3.5-35B-A3B (GPTQ-int4)** | GPTQ-INT4 | XPU | 4-line `_process_weights_xpu` tuple-shape fix needed; perf bottlenecked by GDN Triton fallback |
 | **gpt-oss-20b** | MXFP4 | XPU | (carry-over from v0.21 recipe) |
@@ -117,6 +117,33 @@ This adds it so `benchmark_moe.py` gets past the model-config check.
 (NOTE: the autotuner itself is still structurally CUDA-only on XPU — see
 `project_vllm_benchmark_moe_xpu_unusable`. This patch only fixes the
 known-models gap.)
+
+### 5. `vllm/model_executor/models/config.py` — Gemma 4 per-layer attention backend
+
+Vendors upstream **PR #38891** (still OPEN, `needs-rebase` as of 2026-06-13).
+Fixes issue [#38887](https://github.com/vllm-project/vllm/issues/38887): on
+v0.22.0 stock, `Gemma4Config.verify_and_update_config` forces TRITON_ATTN
+globally whenever the model has heterogeneous head dimensions (head_dim=256
+sliding + global_head_dim=512 full). This penalises the ~83% of Gemma 4
+layers that *can* use the fast FlashAttention path (head_dim=256 ≤ FA's
+kernel limit).
+
+This patch removes the global force and lets vLLM's per-layer backend
+selector route each layer to the best backend it supports:
+
+| Layer type | head_dim | Backend (XPU) |
+|---|---|---|
+| Sliding-window (~83%) | 256 | XPU FlashAttention (fast) |
+| Full-attention (~17%) | 512 | TRITON_ATTN (fallback) |
+
+Expected impact on Lunar Lake / Arc 140V: Gemma 4 26B QAT decode at 16K
+KV should move from ~6 tok/s up to ~12-15 tok/s. Prefill should improve
+similarly. Still below LFM2-24B (17 tok/s flat across 32K) because the
+17% full-attention layers are still Triton-bound.
+
+NOTE: This patch is verbatim port of PR #38891's diff. The upstream
+status is "needs-rebase" so users applying the standalone patch file
+should re-derive against their target vLLM tree.
 
 ---
 
