@@ -39,6 +39,10 @@ class WNA16MoEBackend(Enum):
     MARLIN = "MARLIN"
     BATCHED_MARLIN = "BATCHED_MARLIN"
     XPU = "XPU"
+    # Local patch 2026-06-09: TRITON fallback for XPU when XPUExpertsInt4
+    # rejects the activation (e.g. GELU_TANH for Gemma 4). Paired with
+    # TritonWNA16Experts in fused_moe/experts/triton_moe.py.
+    TRITON = "TRITON"
 
 
 def backend_to_kernel_cls(
@@ -66,6 +70,14 @@ def backend_to_kernel_cls(
 
         return [XPUExpertsInt4]
 
+    elif backend == WNA16MoEBackend.TRITON:
+        # Local patch 2026-06-09: see TritonWNA16Experts.
+        from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
+            TritonWNA16Experts,
+        )
+
+        return [TritonWNA16Experts]
+
     else:
         raise ValueError(f"Unknown WNA16 MoE backend: {backend.value}")
 
@@ -75,7 +87,10 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
     Get available backends in priority order based on platform and config.
     """
     if current_platform.is_xpu():
-        return [WNA16MoEBackend.XPU]
+        # Local patch 2026-06-09: XPU first (CUTLASS-SYCL kernel — fastest for
+        # SwiGLU models like LFM2). TRITON fallback for activations XPUExpertsInt4
+        # doesn't support (e.g. GELU_TANH for Gemma 4).
+        return [WNA16MoEBackend.XPU, WNA16MoEBackend.TRITON]
 
     _AVAILABLE_BACKENDS = [
         WNA16MoEBackend.MARLIN,
@@ -167,6 +182,11 @@ def make_wna16_moe_kernel(
     w13_g_idx_sort_indices: torch.Tensor | None,
     w2_g_idx_sort_indices: torch.Tensor | None,
     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    # Local patch 2026-06-08: caller in compressed_tensors_moe_wna16.py:266
+    # passes layer + shared_experts kwargs that this factory doesn't consume.
+    # Accept-and-ignore unblocks the XPU compressed-tensors WNA16 MoE path.
+    layer=None,
+    shared_experts=None,
 ) -> mk.FusedMoEKernel:
     assert experts_cls is not None
 
@@ -688,6 +708,18 @@ def convert_to_wna16_moe_kernel_format(
             w2_bias,
         )
     elif backend == WNA16MoEBackend.XPU:
+        return _process_weights_xpu(
+            w13,
+            w2,
+            w13_scale,
+            w2_scale,
+            w13_bias,
+            w2_bias,
+        )
+    elif backend == WNA16MoEBackend.TRITON:
+        # Local patch 2026-06-09: TritonWNA16Experts expects the same
+        # transpose(1, 2).contiguous().view(uint8) weight layout the XPU kernel
+        # uses (and that the non-oracle fallback path applies inline below).
         return _process_weights_xpu(
             w13,
             w2,

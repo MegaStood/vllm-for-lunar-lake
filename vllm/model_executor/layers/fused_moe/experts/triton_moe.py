@@ -43,6 +43,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8Static128BlockSym,
     kFp8StaticChannelSym,
     kFp8StaticTensorSym,
+    kInt4Static,
     kInt8DynamicTokenSym,
     kInt8StaticChannelSym,
 )
@@ -457,43 +458,42 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
 
 
 class TritonWNA16Experts(TritonExperts):
+    # Local patch 2026-06-09: wire TritonWNA16Experts into the WNA16 MoE oracle
+    # as a fallback path for XPU (and elsewhere) when the optimized backend
+    # (XPUExpertsInt4 / MarlinExperts) rejects the deployment configuration.
+    # Stubs that previously raised NotImplementedError now return the values
+    # consistent with the underlying Triton fused-MoE kernel's capabilities.
+    # See backup .bak.20260609 timestamp and the paired int_wna16.py patch.
+
     @staticmethod
     def _supports_current_device() -> bool:
-        raise NotImplementedError(
-            "TritonWNA16Experts is not yet used by an Oracle. "
-            "This method should not be called."
-        )
+        # Triton works on CUDA-alike (CUDA, ROCm) + XPU
+        return current_platform.is_cuda_alike() or current_platform.is_xpu()
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
-        raise NotImplementedError(
-            "TritonWNA16Experts is not yet used by an Oracle. "
-            "This method should not be called."
-        )
+        # Same as parent TritonExperts — Triton kernel supports both modes
+        return True
 
     @staticmethod
     def _supports_quant_scheme(
         weight_key: QuantKey | None,
         activation_key: QuantKey | None,
     ) -> bool:
-        raise NotImplementedError(
-            "TritonWNA16Experts is not yet used by an Oracle. "
-            "This method should not be called."
-        )
+        # WNA16: INT4 symmetric weights, no activation quant (bf16/fp16 act)
+        return (weight_key, activation_key) == (kInt4Static, None)
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        raise NotImplementedError(
-            "TritonWNA16Experts is not yet used by an Oracle. "
-            "This method should not be called."
-        )
+        # Inherits the full Triton activation set: SILU, GELU, GELU_TANH,
+        # SWIGLUOAI, SWIGLUSTEP, and *_NO_MUL variants. Crucially this includes
+        # GELU_TANH — what Gemma 4 uses — which XPUExpertsInt4 lacks.
+        return TritonExperts._supports_activation(activation)
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
-        raise NotImplementedError(
-            "TritonWNA16Experts is not yet used by an Oracle. "
-            "This method should not be called."
-        )
+        # Same constraint as parent: reject FlashInfer NVL kernels
+        return TritonExperts._supports_parallel_config(moe_parallel_config)
 
     def apply(
         self,
