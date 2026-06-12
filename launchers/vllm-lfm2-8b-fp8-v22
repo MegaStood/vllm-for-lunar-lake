@@ -1,0 +1,74 @@
+#!/bin/bash
+# LFM2.5-8B-A1B-AWQ-FP8 on STOCK vLLM 0.22.0+xpu / Lunar Lake.
+#
+# Purpose: validate vLLM 0.22's XPU FP8 MoE path (added by upstream PR #41426).
+# This model is compressed-tensors W8A8 float-quantized — distinct from the
+# INT4 INT4 W4A16 path used by lfm2-24b/qwen-coder, which still needs the
+# (broken) #42032 wiring. The FP8 path dispatches as follows:
+#
+#   compressed_tensors_moe.py:144 _is_fp8_w8a8 → True
+#     → CompressedTensorsW8A8Fp8MoEMethod
+#     → select_fp8_moe_backend()  [oracle/fp8.py]
+#     → current_platform.is_xpu() puts Fp8MoeBackend.XPU first
+#     → returns XPUExpertsFp8 (the class #41426 added)
+#
+# No INT4 code touched, no v19 backport, no PR #42032 needed.
+# Only patch carried in ~/vllm-v22-venv is the #40295 UMA-mem backport.
+#
+# Stack
+#   target : /shared/models/lfm2.5-8b-a1b-awq-fp8 (8.6 GB, compressed-tensors FP8 W8A8)
+#   venv   : ~/vllm-v22-venv  (stock vLLM 0.22.0+xpu, ~/install-v22-stock.sh)
+#   class  : Lfm2MoeForCausalLM (registered in v0.22)
+#   ctx    : 128K (matches max_position_embeddings; model is hybrid 7 GQA + 17 ShortConv,
+#                  so KV cost per token is small — see calc below)
+#   port   : 8092  (8083 v21 qwen-coder, 8090 v22 lfm2-24b, 8091 reserved)
+#
+# KV-cache sizing at 128K:
+#   per-token attn KV = 7 layers × 2 (K+V) × 8 kv_heads × 64 head_dim × 2 B FP16
+#                     = 14,336 B/tok
+#   128K tokens       ≈ 1.71 GiB minimum
+#   ShortConv state caches: ~204 KiB per seq (negligible)
+#   Setting 2.5 GiB to leave ~50% headroom for the block allocator.
+
+# ---- gate: host MemAvailable ----
+HOST_AVAIL_GIB=$(awk '/MemAvailable:/ {print int($2/1024/1024)}' /proc/meminfo)
+echo "Host MemAvailable: ${HOST_AVAIL_GIB} GiB"
+# Model FP8 ~9 GB + KV pool 2.5 GiB + Triton JIT/SYCL temporaries ~1-2 GiB.
+# 15 GiB gate leaves ~3 GiB headroom; lowered from 18 GiB on 2026-06-05.
+if [ "$HOST_AVAIL_GIB" -lt 15 ]; then
+    echo "MemAvailable ${HOST_AVAIL_GIB} GiB < 15 GiB — free memory or reboot for a clean load. Abort."
+    exit 1
+fi
+
+# ---- env: scrub oneAPI off LD_LIBRARY_PATH (nosetvars; CRITICAL on this fork) ----
+export LD_LIBRARY_PATH=$(echo "${LD_LIBRARY_PATH:-}" | tr ':' '\n' | grep -v '/opt/intel/oneapi' | paste -sd: -)
+
+source ~/vllm-v22-venv/bin/activate
+export VLLM_TARGET_DEVICE=xpu
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+# ---- Lunar Lake L0 V1 adapter pin ----
+export SYCL_UR_USE_LEVEL_ZERO_V2=0
+export UR_LOADER_USE_LEVEL_ZERO_V2=0
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+
+# ---- persistent JIT caches (DEDICATED to v22 — don't pollute v21 cache) ----
+export SYCL_CACHE_PERSISTENT=1
+export SYCL_CACHE_DIR=${HOME}/.cache/sycl-vllm-xpu-v22
+export NEO_CACHE_PERSISTENT=1
+export NEO_CACHE_DIR=${HOME}/.cache/neo-vllm-xpu-v22
+mkdir -p "$SYCL_CACHE_DIR" "$NEO_CACHE_DIR"
+
+exec vllm serve /shared/models/lfm2.5-8b-a1b-awq-fp8 \
+    --served-model-name lfm2-8b \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.47 \
+    --enforce-eager \
+    --port 8092 \
+    --max-model-len 128000 \
+    --max-num-seqs 1 \
+    --kv-cache-memory-bytes 2684354560 \
+    --enable-auto-tool-choice \
+    --tool-call-parser lfm2 \
+    --reasoning-parser qwen3 \
+    "$@"

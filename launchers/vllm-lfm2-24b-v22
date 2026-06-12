@@ -1,0 +1,102 @@
+#!/bin/bash
+# LFM2-24B-A2B-Instruct on STOCK vLLM 0.22.0+xpu / Lunar Lake.
+#
+# Why this launcher
+#   v22 source review on 2026-06-05 confirmed v22 stock has the FULL
+#   compressed-tensors WNA16 XPU dispatch chain — no v19 backport patches
+#   needed (the v22-XPU-state memory's prediction was wrong about this):
+#
+#     compressed_tensors_moe.py:100  → `if current_platform.is_xpu(): return
+#         CompressedTensorsWNA16MoEMethod(...)` (NOT the Marlin variant)
+#     compressed_tensors_moe_wna16.py:66 → explicit XPU branch (W4A16-only)
+#     fused_moe/oracle/int_wna16.py     → WNA16MoEBackend.XPU → XPUExpertsInt4
+#     fused_moe/experts/xpu_moe.py:223  → XPUExpertsInt4 (CUTLASS-SYCL grouped GEMM)
+#
+#   The model is verified compatible:
+#     - quant_method = compressed-tensors, format = pack-quantized
+#     - symmetric: true, num_bits: 4, group_size: 32, type: int
+#     - safetensors keys: weight_packed/weight_scale/weight_shape, NO zeros
+#     - hidden_size=2048 (256-aligned, won't hit Nemotron-H shape crash)
+#     → matches kInt4Static (the only QuantKey XPUExpertsInt4 whitelists)
+#
+# Predicted behavior (extrapolating from v21 fork on identical kernel)
+#   v21 fork measured: 22 tok/s burst, 17 tok/s sustained, no decode wall to 32K
+#   v22 stock: same underlying CUTLASS-SYCL kernel, expect similar perf
+#   First confirmation goal: "loads + serves + reasonable answer"
+#
+# Log line to watch for at startup
+#   v21 fork logged: "Using Marlin backend for WNA16 MoE" (misnomer — was XPU)
+#   v22 stock should log either:
+#     "Using CompressedTensorsWNA16MoEMethod"     ← Method-class side
+#     or a WNA16MoEBackend.XPU selection log     ← oracle side
+#   If it logs "Using Marlin" or "Using CompressedTensorsWNA16MarlinMoEMethod"
+#   on v22 stock, that would mean it picked the CUDA Marlin branch (which
+#   fails on XPU) — that's a misrouting bug to chase.
+#
+# Stack
+#   target : /shared/models/lfm2-24b-a2b-awq-4bit
+#            (folder says "awq" — TRAP. On-disk format is compressed-tensors
+#             pack-quantized INT4 group_size=32 SYMMETRIC. Verified by
+#             safetensors keys 2026-06-05. NOT classical AWQ.)
+#   venv   : ~/vllm-v22-venv  (stock vLLM 0.22.0+xpu, ~/install-v22-stock.sh)
+#   class  : Lfm2MoeForCausalLM (registered in v0.22)
+#   attn   : 1:3 GQA-to-ShortConv (10 full_attention / 30 conv out of 40 layers)
+#   gqa    : 32 heads / 8 kv_heads / head_dim 64 (GQA 4:1)
+#   moe    : 4 experts active per token (2B active out of 24B total)
+#   ctx    : 32K official trained ceiling (NOT 128K — config has 128K but
+#            that's the RoPE arch ceiling; past 32K = silent quality drop)
+#   port   : 8090 (8092 = FP8 production v22; 8083 = qwen-coder v21 fork)
+#
+# REASONING / TOOL CALLING
+#   - NOT a reasoning model. NO --reasoning-parser (would silently mangle).
+#   - Tool calls: pythonic format, --tool-call-parser lfm2
+#
+# DELIBERATELY OFF
+#   --enforce-eager : XPU Graph untested; today's 8B FP8 eager-off probe on
+#                     v22 showed no measurable gain. Keep eager for safety.
+#   speculative-config : LFM2-24B has no MTP head.
+#
+# COEXISTENCE
+#   The FP8 production server on port 8092 needs ~9-12 GiB GPU; the 24B INT4
+#   needs ~17-20 GiB. They CANNOT coexist on 28.57 GiB UMA. Stop FP8 first
+#   (the script does NOT enforce this — kept simple for control-experiment use).
+
+# ---- gate: host MemAvailable ----
+HOST_AVAIL_GIB=$(awk '/MemAvailable:/ {print int($2/1024/1024)}' /proc/meminfo)
+echo "Host MemAvailable: ${HOST_AVAIL_GIB} GiB"
+if [ "$HOST_AVAIL_GIB" -lt 22 ]; then
+    echo "MemAvailable ${HOST_AVAIL_GIB} GiB < 22 GiB — free memory or reboot for a clean load. Abort."
+    exit 1
+fi
+
+# ---- env: scrub oneAPI off LD_LIBRARY_PATH (nosetvars; CRITICAL on this fork) ----
+export LD_LIBRARY_PATH=$(echo "${LD_LIBRARY_PATH:-}" | tr ':' '\n' | grep -v '/opt/intel/oneapi' | paste -sd: -)
+
+source ~/vllm-v22-venv/bin/activate
+export VLLM_TARGET_DEVICE=xpu
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+# ---- Lunar Lake L0 V1 adapter pin ----
+export SYCL_UR_USE_LEVEL_ZERO_V2=0
+export UR_LOADER_USE_LEVEL_ZERO_V2=0
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+
+# ---- persistent JIT caches (DEDICATED to v22 — don't pollute v21 cache) ----
+export SYCL_CACHE_PERSISTENT=1
+export SYCL_CACHE_DIR=${HOME}/.cache/sycl-vllm-xpu-v22
+export NEO_CACHE_PERSISTENT=1
+export NEO_CACHE_DIR=${HOME}/.cache/neo-vllm-xpu-v22
+mkdir -p "$SYCL_CACHE_DIR" "$NEO_CACHE_DIR"
+
+exec vllm serve /shared/models/lfm2-24b-a2b-awq-4bit \
+    --served-model-name lfm2-24b \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.65 \
+    --enforce-eager \
+    --port 8090 \
+    --max-model-len 32768 \
+    --max-num-seqs 1 \
+    --kv-cache-memory-bytes 3221225472 \
+    --enable-auto-tool-choice \
+    --tool-call-parser lfm2 \
+    "$@"

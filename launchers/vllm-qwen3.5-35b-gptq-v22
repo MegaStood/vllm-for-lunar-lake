@@ -1,0 +1,68 @@
+#!/bin/bash
+# qwen3.5-35b-a3b GPTQ-INT4 (official Qwen/cyankiwi-style packing) smoke test
+# on stock vLLM 0.22.0+xpu + local patches / Lunar Lake.
+# Drafted 2026-06-09.
+#
+# Stack
+#   target : /shared/models/qwen3.5-35b-a3b-gptq-int4 (23 GB)
+#   venv   : ~/vllm-v22-venv
+#   arch   : Qwen3_5MoeForConditionalGeneration (Qwen3-Next hybrid + Qwen3-VL)
+#   quant  : gptq sym=True desc_act=False bits=4 group=128
+#            classical GPTQ packing: qweight/qzeros/scales/g_idx
+#            (NOT compressed-tensors WNA16 — see [[cyankiwi-quant-format-traps]])
+#   port   : 8094
+#
+# WHY THIS, NOT THE AUTOROUND VARIANT:
+#   The autoround variant (qwen3.5-35b-a3b-int4-autoround) routed through INCConfig.
+#   At MoE layer selection, vLLM logged "Using XPU Unquantized MoE backend" → loaded
+#   the 256 experts as bf16 → kswapd OOM → kernel killed openclaw-gateway and the
+#   system rebooted (verified in journalctl 23:14:16 on 2026-06-09).
+#
+# WHAT GPTQ MIGHT GIVE US:
+#   - Linear layers: AutoGPTQConfig → XPUwNa16LinearKernel (proven path on v22)
+#   - MoE layers: gptq quantized per-expert in safetensors (verified — every
+#     gate_proj/up_proj has qweight+qzeros+scales+g_idx). Dispatch on XPU goes
+#     through WNA16 MoE oracle (our patched int_wna16.py). XPUExpertsInt4 wants
+#     compressed-tensors layout (weight_packed); GPTQ format will likely either
+#     get converted internally or fall through to TRITON. Either way, NOT to
+#     XPUUnquantizedMoE — the experts ARE quantized in the file.
+#   - Or it just refuses with a backend-mismatch error — also fine, clean failure.
+
+# ---- gate: host MemAvailable ----
+HOST_AVAIL_GIB=$(awk '/MemAvailable:/ {print int($2/1024/1024)}' /proc/meminfo)
+echo "Host MemAvailable: ${HOST_AVAIL_GIB} GiB"
+if [ "$HOST_AVAIL_GIB" -lt 22 ]; then
+    echo "MemAvailable ${HOST_AVAIL_GIB} GiB < 22 GiB — gptq variant is 23 GB on disk."
+    echo "Need a clean slate. Reboot if recently OOM'd. Abort."
+    exit 1
+fi
+
+# ---- env: scrub oneAPI off LD_LIBRARY_PATH (nosetvars) ----
+export LD_LIBRARY_PATH=$(echo "${LD_LIBRARY_PATH:-}" | tr ':' '\n' | grep -v '/opt/intel/oneapi' | paste -sd: -)
+
+source ~/vllm-v22-venv/bin/activate
+export VLLM_TARGET_DEVICE=xpu
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+# ---- Lunar Lake L0 V1 adapter pin ----
+export SYCL_UR_USE_LEVEL_ZERO_V2=0
+export UR_LOADER_USE_LEVEL_ZERO_V2=0
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+
+# ---- persistent JIT caches (v22 dedicated) ----
+export SYCL_CACHE_PERSISTENT=1
+export SYCL_CACHE_DIR=${HOME}/.cache/sycl-vllm-xpu-v22
+export NEO_CACHE_PERSISTENT=1
+export NEO_CACHE_DIR=${HOME}/.cache/neo-vllm-xpu-v22
+mkdir -p "$SYCL_CACHE_DIR" "$NEO_CACHE_DIR"
+
+exec vllm serve /shared/models/qwen3.5-35b-a3b-gptq-int4 \
+    --served-model-name qwen3.5-35b-gptq \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.60 \
+    --enforce-eager \
+    --port 8094 \
+    --max-model-len 8192 \
+    --max-num-seqs 1 \
+    --kv-cache-memory-bytes 2000000000 \
+    "$@"

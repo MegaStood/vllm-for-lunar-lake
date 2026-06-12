@@ -1,0 +1,561 @@
+From 0fd604c7202ae5f5427143960e3b98fec349b182 Mon Sep 17 00:00:00 2001
+From: "Jin, Youzhi" <youzhi.jin@intel.com>
+Date: Fri, 8 May 2026 13:36:52 +0800
+Subject: [PATCH] [Feat][XPU] Implement WNA16 MoE backend support with INT4
+ quantization
+
+Co-authored-by: Copilot <copilot@github.com>
+---
+ .../moe/test_int_wna16_backend_selection.py   | 138 ++++++++++++++++++
+ .../layers/fused_moe/experts/xpu_moe.py       |  30 ++++
+ .../layers/fused_moe/oracle/int_wna16.py      | 114 ++++++++++++---
+ .../compressed_tensors_moe.py                 |   1 +
+ .../compressed_tensors_moe_wna16.py           |  96 +++++++++++-
+ 5 files changed, 360 insertions(+), 19 deletions(-)
+ create mode 100644 tests/kernels/moe/test_int_wna16_backend_selection.py
+
+diff --git a/tests/kernels/moe/test_int_wna16_backend_selection.py b/tests/kernels/moe/test_int_wna16_backend_selection.py
+new file mode 100644
+index 0000000..cdebb3f
+--- /dev/null
++++ b/tests/kernels/moe/test_int_wna16_backend_selection.py
+@@ -0,0 +1,138 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from unittest.mock import patch
++
++import pytest
++import torch
++
++from tests.kernels.moe.utils import make_dummy_moe_config
++from vllm.model_executor.layers.fused_moe.experts.xpu_moe import XPUExpertsInt4
++from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
++    WNA16MoEBackend,
++    convert_to_wna16_moe_kernel_format,
++    select_wna16_moe_backend,
++)
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    kInt4Static,
++    kInt8Static,
++)
++
++
++def test_select_xpu_wna16_int4_backend():
++    with (
++        patch(
++            "vllm.model_executor.layers.fused_moe.oracle.int_wna16.current_platform"
++        ) as oracle_platform,
++        patch(
++            "vllm.model_executor.layers.fused_moe.experts.xpu_moe.current_platform"
++        ) as xpu_platform,
++    ):
++        oracle_platform.is_xpu.return_value = True
++        xpu_platform.is_xpu.return_value = True
++
++        backend, experts_cls = select_wna16_moe_backend(
++            make_dummy_moe_config(),
++            kInt4Static,
++            weight_bits=4,
++        )
++
++    assert backend == WNA16MoEBackend.XPU
++    assert experts_cls is XPUExpertsInt4
++
++
++def test_select_xpu_wna16_rejects_int8():
++    with (
++        patch(
++            "vllm.model_executor.layers.fused_moe.oracle.int_wna16.current_platform"
++        ) as oracle_platform,
++        patch(
++            "vllm.model_executor.layers.fused_moe.experts.xpu_moe.current_platform"
++        ) as xpu_platform,
++    ):
++        oracle_platform.is_xpu.return_value = True
++        xpu_platform.is_xpu.return_value = True
++
++        with pytest.raises(NotImplementedError):
++            select_wna16_moe_backend(
++                make_dummy_moe_config(),
++                kInt8Static,
++                weight_bits=8,
++            )
++
++
++def test_convert_xpu_wna16_moe_kernel_format():
++    num_experts = 2
++    hidden_size = 16
++    intermediate_size = 8
++    group_size = 4
++    pack_factor = 8
++
++    w13 = torch.arange(
++        num_experts * (hidden_size // pack_factor) * (2 * intermediate_size),
++        dtype=torch.int32,
++    ).reshape(num_experts, hidden_size // pack_factor, 2 * intermediate_size)
++    w2 = torch.arange(
++        num_experts * (intermediate_size // pack_factor) * hidden_size,
++        dtype=torch.int32,
++    ).reshape(num_experts, intermediate_size // pack_factor, hidden_size)
++    w13_scale = torch.randn(
++        num_experts,
++        hidden_size // group_size,
++        2 * intermediate_size,
++        dtype=torch.float16,
++    )
++    w2_scale = torch.randn(
++        num_experts,
++        intermediate_size // group_size,
++        hidden_size,
++        dtype=torch.float16,
++    )
++
++    (
++        xpu_w13,
++        xpu_w2,
++        xpu_w13_scale,
++        xpu_w2_scale,
++        w13_g_idx,
++        w2_g_idx,
++        w13_g_idx_sort_indices,
++        w2_g_idx_sort_indices,
++        w13_input_global_scale,
++        w2_input_global_scale,
++        _w13_bias,
++        _w2_bias,
++    ) = convert_to_wna16_moe_kernel_format(
++        backend=WNA16MoEBackend.XPU,
++        layer=torch.nn.Module(),
++        quant_config=None,
++        input_dtype=None,
++        w13=w13,
++        w2=w2,
++        w13_scale=w13_scale,
++        w2_scale=w2_scale,
++        w13_g_idx=torch.empty(0),
++        w2_g_idx=torch.empty(0),
++    )
++
++    assert torch.equal(xpu_w13, w13.transpose(1, 2).contiguous().view(torch.uint8))
++    assert torch.equal(xpu_w2, w2.transpose(1, 2).contiguous().view(torch.uint8))
++    assert torch.equal(xpu_w13_scale, w13_scale.transpose(1, 2).contiguous())
++    assert torch.equal(xpu_w2_scale, w2_scale.transpose(1, 2).contiguous())
++    assert xpu_w13.shape == (num_experts, 2 * intermediate_size, hidden_size // 2)
++    assert xpu_w2.shape == (num_experts, hidden_size, intermediate_size // 2)
++    assert xpu_w13_scale.shape == (
++        num_experts,
++        2 * intermediate_size,
++        hidden_size // group_size,
++    )
++    assert xpu_w2_scale.shape == (
++        num_experts,
++        hidden_size,
++        intermediate_size // group_size,
++    )
++    assert w13_g_idx is None
++    assert w2_g_idx is None
++    assert w13_g_idx_sort_indices is None
++    assert w2_g_idx_sort_indices is None
++    assert w13_input_global_scale is None
++    assert w2_input_global_scale is None
+diff --git a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+index fa6ff2c..85347bf 100644
+--- a/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
++++ b/vllm/model_executor/layers/fused_moe/experts/xpu_moe.py
+@@ -16,6 +16,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     QuantKey,
+     kFp8DynamicTensorSym,
+     kFp8StaticTensorSym,
++    kInt4Static,
+     kMxfp4Static,
+     kMxfp8Dynamic,
+     kMxfp8Static,
+@@ -48,6 +49,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
+             num_dispatchers,
+         )
+         self.is_fp8 = False
++        self.is_int4 = False
+         self.is_mxfp4 = False
+         self.is_mxfp8 = False
+         self.fused_moe_impl: XpuFusedMoe | None = None
+@@ -148,6 +150,7 @@ class XPUExperts(mk.FusedMoEExpertsModular):
+                 ep_rank=self.moe_config.ep_rank,
+                 ep_size=self.moe_config.ep_size,
+                 is_fp8=self.is_fp8,
++                is_int4=self.is_int4,
+                 is_mxfp4=self.is_mxfp4,
+                 is_mxfp8=self.is_mxfp8,
+             )
+@@ -217,6 +220,33 @@ class XPUExpertsMxfp8(XPUExpertsFp8):
+         return (weight_key, activation_key) in SUPPORTED_W_A
+ 
+ 
++class XPUExpertsInt4(XPUExperts):
++    def __init__(
++        self,
++        moe_config: FusedMoEConfig,
++        quant_config: FusedMoEQuantConfig,
++        max_num_tokens: int | None = None,
++        num_dispatchers: int | None = None,
++    ):
++        super().__init__(
++            moe_config,
++            quant_config,
++            max_num_tokens,
++            num_dispatchers,
++        )
++        self.is_int4 = True
++
++    @staticmethod
++    def _supports_quant_scheme(
++        weight_key: QuantKey | None,
++        activation_key: QuantKey | None,
++    ) -> bool:
++        SUPPORTED_W_A = [
++            (kInt4Static, None),
++        ]
++        return (weight_key, activation_key) in SUPPORTED_W_A
++
++
+ class XPUExpertsMXFp4(XPUExperts):
+     def __init__(
+         self,
+diff --git a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
+index c7edd9a..13116ba 100644
+--- a/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
++++ b/vllm/model_executor/layers/fused_moe/oracle/int_wna16.py
+@@ -26,6 +26,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     QuantKey,
+ )
++from vllm.platforms import current_platform
+ 
+ if TYPE_CHECKING:
+     from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQConfig
+@@ -37,6 +38,7 @@ logger = init_logger(__name__)
+ class WNA16MoEBackend(Enum):
+     MARLIN = "MARLIN"
+     BATCHED_MARLIN = "BATCHED_MARLIN"
++    XPU = "XPU"
+ 
+ 
+ def backend_to_kernel_cls(
+@@ -57,6 +59,13 @@ def backend_to_kernel_cls(
+ 
+         return [BatchedMarlinExperts]
+ 
++    elif backend == WNA16MoEBackend.XPU:
++        from vllm.model_executor.layers.fused_moe.experts.xpu_moe import (
++            XPUExpertsInt4,
++        )
++
++        return [XPUExpertsInt4]
++
+     else:
+         raise ValueError(f"Unknown WNA16 MoE backend: {backend.value}")
+ 
+@@ -65,6 +74,9 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
+     """
+     Get available backends in priority order based on platform and config.
+     """
++    if current_platform.is_xpu():
++        return [WNA16MoEBackend.XPU]
++
+     _AVAILABLE_BACKENDS = [
+         WNA16MoEBackend.MARLIN,
+         WNA16MoEBackend.BATCHED_MARLIN,
+@@ -156,8 +168,7 @@ def make_wna16_moe_kernel(
+     w2_g_idx_sort_indices: torch.Tensor | None,
+     routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+ ) -> mk.FusedMoEKernel:
+-    # Currently, we only support MarlinExperts and BatchedMarlinExperts
+-    assert experts_cls in (MarlinExperts, BatchedMarlinExperts)
++    assert experts_cls is not None
+ 
+     from vllm.model_executor.layers.fused_moe.all2all_utils import (
+         maybe_make_prepare_finalize,
+@@ -172,31 +183,52 @@ def make_wna16_moe_kernel(
+     assert prepare_finalize is not None
+     assert isinstance(prepare_finalize, mk.FusedMoEPrepareAndFinalizeModular)
+ 
+-    if prepare_finalize.activation_format == mk.FusedMoEActivationFormat.BatchedExperts:
+-        assert experts_cls == BatchedMarlinExperts
++    if experts_cls in (MarlinExperts, BatchedMarlinExperts):
++        if (
++            prepare_finalize.activation_format
++            == mk.FusedMoEActivationFormat.BatchedExperts
++        ):
++            assert experts_cls == BatchedMarlinExperts
++            max_num_tokens = prepare_finalize.max_num_tokens_per_rank()
++            assert max_num_tokens is not None
++            experts: mk.FusedMoEExperts = BatchedMarlinExperts(
++                max_num_tokens=max_num_tokens,
++                num_dispatchers=prepare_finalize.num_dispatchers(),
++                moe_config=moe_config,
++                quant_config=moe_quant_config,
++                w13_g_idx=w13_g_idx,
++                w2_g_idx=w2_g_idx,
++                w13_g_idx_sort_indices=w13_g_idx_sort_indices,
++                w2_g_idx_sort_indices=w2_g_idx_sort_indices,
++                is_k_full=is_k_full,
++            )
++        else:
++            assert experts_cls == MarlinExperts
++            experts = MarlinExperts(
++                moe_config=moe_config,
++                quant_config=moe_quant_config,
++                w13_g_idx=w13_g_idx,
++                w2_g_idx=w2_g_idx,
++                w13_g_idx_sort_indices=w13_g_idx_sort_indices,
++                w2_g_idx_sort_indices=w2_g_idx_sort_indices,
++                is_k_full=is_k_full,
++            )
++    elif (
++        prepare_finalize.activation_format
++        == mk.FusedMoEActivationFormat.BatchedExperts
++    ):
+         max_num_tokens = prepare_finalize.max_num_tokens_per_rank()
+         assert max_num_tokens is not None
+-        experts: mk.FusedMoEExperts = BatchedMarlinExperts(
++        experts = experts_cls(
+             max_num_tokens=max_num_tokens,
+             num_dispatchers=prepare_finalize.num_dispatchers(),
+             moe_config=moe_config,
+             quant_config=moe_quant_config,
+-            w13_g_idx=w13_g_idx,
+-            w2_g_idx=w2_g_idx,
+-            w13_g_idx_sort_indices=w13_g_idx_sort_indices,
+-            w2_g_idx_sort_indices=w2_g_idx_sort_indices,
+-            is_k_full=is_k_full,
+         )
+     else:
+-        assert experts_cls == MarlinExperts
+-        experts = MarlinExperts(
++        experts = experts_cls(
+             moe_config=moe_config,
+             quant_config=moe_quant_config,
+-            w13_g_idx=w13_g_idx,
+-            w2_g_idx=w2_g_idx,
+-            w13_g_idx_sort_indices=w13_g_idx_sort_indices,
+-            w2_g_idx_sort_indices=w2_g_idx_sort_indices,
+-            is_k_full=is_k_full,
+         )
+ 
+     return mk.FusedMoEKernel(
+@@ -525,10 +557,47 @@ def _process_awq_weights_marlin(
+     )
+ 
+ 
++def _process_weights_xpu(
++    w13_qweight: torch.Tensor,
++    w2_qweight: torch.Tensor,
++    w13_scales: torch.Tensor,
++    w2_scales: torch.Tensor,
++    w13_bias: torch.Tensor | None = None,
++    w2_bias: torch.Tensor | None = None,
++) -> tuple[
++    torch.Tensor,  # w13_qweight
++    torch.Tensor,  # w2_qweight
++    torch.Tensor,  # w13_scales
++    torch.Tensor,  # w2_scales
++    None,  # w13_g_idx
++    None,  # w2_g_idx
++    None,  # w13_g_idx_sort_indices
++    None,  # w2_g_idx_sort_indices
++    None,  # w13_input_global_scale
++    None,  # w2_input_global_scale
++    torch.Tensor | None,  # w13_bias
++    torch.Tensor | None,  # w2_bias
++]:
++    return (
++        w13_qweight.transpose(1, 2).contiguous().view(torch.uint8),
++        w2_qweight.transpose(1, 2).contiguous().view(torch.uint8),
++        w13_scales.transpose(1, 2).contiguous(),
++        w2_scales.transpose(1, 2).contiguous(),
++        None,
++        None,
++        None,
++        None,
++        None,
++        None,
++        w13_bias,
++        w2_bias,
++    )
++
++
+ def convert_to_wna16_moe_kernel_format(
+     backend: WNA16MoEBackend,
+     layer: torch.nn.Module,
+-    quant_config: QuantizationConfig,
++    quant_config: QuantizationConfig | None,
+     input_dtype: torch.dtype | None,
+     w13: torch.Tensor,
+     w2: torch.Tensor,
+@@ -618,5 +687,14 @@ def convert_to_wna16_moe_kernel_format(
+             w13_bias,
+             w2_bias,
+         )
++    elif backend == WNA16MoEBackend.XPU:
++        return _process_weights_xpu(
++            w13,
++            w2,
++            w13_scale,
++            w2_scale,
++            w13_bias,
++            w2_bias,
++        )
+     else:
+         raise ValueError(f"Unsupported wna16 MoE backend: {backend.value}")
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe.py
+index a2e9416..20beb4c 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe.py
+@@ -97,6 +97,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
+             if (
+                 not check_moe_marlin_supports_layer(layer, group_size)
+                 or current_platform.is_rocm()
++                or current_platform.is_xpu()
+             ):
+                 from .compressed_tensors_moe_wna16 import (
+                     CompressedTensorsWNA16MoEMethod,
+diff --git a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16.py b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16.py
+index f641819..9b76aeb 100644
+--- a/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16.py
++++ b/vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_wna16.py
+@@ -19,10 +19,19 @@ from vllm.model_executor.layers.fused_moe.config import (
+     int4_w4a16_moe_quant_config,
+     int8_w8a16_moe_quant_config,
+ )
++from vllm.model_executor.layers.fused_moe.oracle.int_wna16 import (
++    convert_to_wna16_moe_kernel_format,
++    make_wna16_moe_kernel,
++    select_wna16_moe_backend,
++)
+ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import (  # noqa E501
+     CompressedTensorsMoEMethod,
+ )
+-from vllm.model_executor.utils import set_weight_attrs
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    kInt4Static,
++)
++from vllm.model_executor.utils import replace_parameter, set_weight_attrs
++from vllm.platforms import current_platform
+ 
+ logger = init_logger(__name__)
+ 
+@@ -50,6 +59,19 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
+         assert weight_quant.symmetric, (
+             "Only symmetric quantization is supported for MoE"
+         )
++        self.wna16_moe_backend = None
++        self.experts_cls = None
++        self.moe_kernel = None
++        if current_platform.is_xpu():
++            if self.num_bits != 4:
++                raise NotImplementedError(
++                    "XPU WNA16 MoE currently supports W4A16 only."
++                )
++            self.wna16_moe_backend, self.experts_cls = select_wna16_moe_backend(
++                moe,
++                kInt4Static,
++                self.num_bits,
++            )
+ 
+     def create_weights(
+         self,
+@@ -180,6 +202,47 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
+         layer.a2_scale = None
+ 
+     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
++        if self.wna16_moe_backend is not None:
++            (
++                w13,
++                w2,
++                w13_scale,
++                w2_scale,
++                _w13_g_idx,
++                _w2_g_idx,
++                _w13_g_idx_sort_indices,
++                _w2_g_idx_sort_indices,
++                _w13_input_global_scale,
++                _w2_input_global_scale,
++                w13_bias,
++                w2_bias,
++            ) = convert_to_wna16_moe_kernel_format(
++                backend=self.wna16_moe_backend,
++                layer=layer,
++                quant_config=None,
++                input_dtype=None,
++                w13=layer.w13_weight_packed,
++                w2=layer.w2_weight_packed,
++                w13_scale=layer.w13_weight_scale,
++                w2_scale=layer.w2_weight_scale,
++                w13_g_idx=layer.w13_weight_g_idx,
++                w2_g_idx=layer.w2_weight_g_idx,
++                w13_bias=getattr(layer, "w13_bias", None),
++                w2_bias=getattr(layer, "w2_bias", None),
++            )
++
++            replace_parameter(layer, "w13_weight_packed", w13)
++            replace_parameter(layer, "w2_weight_packed", w2)
++            replace_parameter(layer, "w13_weight_scale", w13_scale)
++            replace_parameter(layer, "w2_weight_scale", w2_scale)
++            if w13_bias is not None:
++                replace_parameter(layer, "w13_bias", w13_bias)
++            if w2_bias is not None:
++                replace_parameter(layer, "w2_bias", w2_bias)
++
++            self._setup_kernel(layer)
++            return
++
+         # Reconfigure packed weights and scales to match moe_wna16 format
+         layer.w13_weight_packed = torch.nn.Parameter(
+             layer.w13_weight_packed.transpose(1, 2).contiguous().view(torch.uint8),
+@@ -196,6 +259,23 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
+             layer.w2_weight_scale.transpose(1, 2).contiguous(), requires_grad=False
+         )
+ 
++    def _setup_kernel(self, layer: FusedMoE) -> None:
++        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
++        assert self.experts_cls is not None
++        self.moe_kernel = make_wna16_moe_kernel(
++            moe_quant_config=self.moe_quant_config,
++            moe_config=self.moe,
++            experts_cls=self.experts_cls,
++            layer=layer,
++            is_k_full=True,
++            w13_g_idx=None,
++            w2_g_idx=None,
++            w13_g_idx_sort_indices=None,
++            w2_g_idx_sort_indices=None,
++            routing_tables=layer._maybe_init_expert_routing_tables(),
++            shared_experts=layer.shared_experts,
++        )
++
+     def get_fused_moe_quant_config(
+         self, layer: torch.nn.Module
+     ) -> FusedMoEQuantConfig | None:
+@@ -248,6 +328,20 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
+         shared_experts: SharedExperts | None,
+         shared_experts_input: torch.Tensor | None,
+     ) -> torch.Tensor:
++        if self.moe_kernel is not None:
++            return self.moe_kernel.apply(
++                x,
++                layer.w13_weight_packed,
++                layer.w2_weight_packed,
++                topk_weights=topk_weights,
++                topk_ids=topk_ids,
++                activation=layer.activation,
++                global_num_experts=layer.global_num_experts,
++                expert_map=layer.expert_map,
++                apply_router_weight_on_input=layer.apply_router_weight_on_input,
++                shared_experts_input=shared_experts_input,
++            )
++
+         from vllm.model_executor.layers.fused_moe import fused_experts
+ 
+         return fused_experts(
+-- 
+2.54.0
+

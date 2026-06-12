@@ -1,0 +1,79 @@
+#!/bin/bash
+# gemma-4-26B-A4B-it QAT-q4_0 (W4A16-CT export) on STOCK vLLM 0.22.0+xpu / Lunar Lake.
+# Drafted 2026-06-09 — smoke test only, no MTP.
+#
+# Stack
+#   target : /shared/models/gemma4-26b-a4b-it-qat-w4a16-ct (17 GB, compressed-tensors W4A16
+#            sym INT4 group_size=32, QAT-trained for q4_0 by Google, W4A16-CT export by
+#            reinforce20001)
+#   venv   : ~/vllm-v22-venv (stock vLLM 0.22.0+xpu + local int_wna16.py 3-line patch)
+#   class  : Gemma4ForConditionalGeneration
+#   port   : 8095 (8090 reserved for lfm2-24b-v22, 8092 for lfm2-8b-fp8)
+#
+# Dispatch chain expected (same as lfm2-24b-v22):
+#   compressed_tensors_moe.py:100 → is_xpu() → CompressedTensorsWNA16MoEMethod
+#   int_wna16.py:make_wna16_moe_kernel (patched) → WNA16MoEBackend.XPU → XPUExpertsInt4
+#
+# Known Gemma 4 v22 issues (per [[project_gemma4_test_queued]] memory):
+#   - Heterogeneous head_dim → forces TRITON_ATTN backend (not Flash Attention).
+#     vLLM issue #38887 still open in v22. Affects perf: Gemma 4 attention is
+#     structurally slower than LFM2's. Expect 10-14 tok/s decode vs LFM2-24B's 17.
+#   - OpenClaw stall detector aborts requests at 6:15. Direct curl works fine.
+#
+# REASONING / TOOL CALLING
+#   Gemma 4 is a reasoning model with configurable thinking modes ("All models in
+#   the family are designed as highly capable reasoners").
+#   - --reasoning-parser gemma4
+#   - --tool-call-parser gemma4
+#   - --chat-template uses v22's tool_chat_template_gemma4.jinja
+#
+# MTP / SPECULATIVE DECODING
+#   Enabled 2026-06-09 (matches v21 vllm-gemma4-mtp-test pattern).
+#   Drafter: /shared/models/gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant
+#   (Gemma4AssistantForCausalLM, QAT-matched to the main — same q4_0 base).
+#   v21 baseline at num_spec=2: 69.7% draft accept on Stage 2 smoke test.
+
+# ---- gate: host MemAvailable ----
+HOST_AVAIL_GIB=$(awk '/MemAvailable:/ {print int($2/1024/1024)}' /proc/meminfo)
+echo "Host MemAvailable: ${HOST_AVAIL_GIB} GiB"
+if [ "$HOST_AVAIL_GIB" -lt 22 ]; then
+    echo "MemAvailable ${HOST_AVAIL_GIB} GiB < 22 GiB — free memory or reboot for a clean load. Abort."
+    exit 1
+fi
+
+# ---- env: scrub oneAPI off LD_LIBRARY_PATH (nosetvars) ----
+export LD_LIBRARY_PATH=$(echo "${LD_LIBRARY_PATH:-}" | tr ':' '\n' | grep -v '/opt/intel/oneapi' | paste -sd: -)
+
+source ~/vllm-v22-venv/bin/activate
+export VLLM_TARGET_DEVICE=xpu
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+# ---- Lunar Lake L0 V1 adapter pin ----
+export SYCL_UR_USE_LEVEL_ZERO_V2=0
+export UR_LOADER_USE_LEVEL_ZERO_V2=0
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+
+# ---- persistent JIT caches (v22 dedicated) ----
+export SYCL_CACHE_PERSISTENT=1
+export SYCL_CACHE_DIR=${HOME}/.cache/sycl-vllm-xpu-v22
+export NEO_CACHE_PERSISTENT=1
+export NEO_CACHE_DIR=${HOME}/.cache/neo-vllm-xpu-v22
+mkdir -p "$SYCL_CACHE_DIR" "$NEO_CACHE_DIR"
+
+CHAT_TEMPLATE=~/vllm-v22/examples/tool_chat_template_gemma4.jinja
+
+exec vllm serve /shared/models/gemma4-26b-a4b-it-qat-w4a16-ct \
+    --served-model-name gemma-4-qat \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.65 \
+    --enforce-eager \
+    --port 8095 \
+    --max-model-len 32768 \
+    --max-num-seqs 1 \
+    --kv-cache-memory-bytes 2500000000 \
+    --enable-auto-tool-choice \
+    --tool-call-parser gemma4 \
+    --reasoning-parser gemma4 \
+    --chat-template "$CHAT_TEMPLATE" \
+    --speculative-config '{"model": "/shared/models/gemma-4-26b-a4b-it-qat-q4_0-unquantized-assistant", "num_speculative_tokens": 2}' \
+    "$@"

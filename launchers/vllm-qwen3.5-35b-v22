@@ -1,0 +1,71 @@
+#!/bin/bash
+# qwen3.5-35b-a3b INT4 (auto-round, Qwen3-Next hybrid GDN + Qwen3-VL) smoke test
+# on stock vLLM 0.22.0+xpu + local patches / Lunar Lake.
+# Drafted 2026-06-09.
+#
+# Stack
+#   target : /shared/models/qwen3.5-35b-a3b-int4-autoround (21 GB)
+#   venv   : ~/vllm-v22-venv
+#   arch   : Qwen3_5MoeForConditionalGeneration
+#            - Qwen3-Next hybrid: 40 layers, gated DeltaNet (linear attn) + standard attn
+#            - VLM: vision tower (Qwen3-VL deepstack)
+#            - MoE: 256 experts top-8, moe_intermediate=512
+#            - hidden=2048, head_dim=256, num_heads=16
+#            - context: 262K (we cap at 8K for smoke test)
+#   quant  : auto-round INT4 group_size=128 → routes via INCConfig
+#            (auto_round:auto_gptq packing). Language layers + MTP layers
+#            quantized; shared experts kept FP16; vision tower NOT quantized.
+#   port   : 8094 (gpt-oss 8081, qwen4b 8082, lfm2-24b 8090, lfm2-8b 8092, gemma4 8095)
+#
+# RISKS (we're firing this to find out which ones bite):
+#   1. INC (Intel Neural Compressor) auto-round MoE path on XPU is unverified;
+#      our v19-backport int4_marlin path only knows compressed-tensors WNA16
+#      and stock gptq, NOT INC. May fall back to a Triton path or refuse.
+#   2. Gated DeltaNet has forward_xpu (vllm/model_executor/layers/mamba/gdn/
+#      qwen_gdn_linear_attn.py:374) — first-use untested on Lunar Lake.
+#   3. Vision tower init may fail without VLLM_USE_V1_VLM=1 or similar.
+#   4. 256-expert routing × moe_intermediate=512 means tiny per-expert GEMMs;
+#      even if XPU path engages, perf likely poor compared to LFM2's 32×3072.
+#   5. Disk model 21 GB + shared experts FP16 + vision tower → may OOM under
+#      gpu-mem-util 0.55 with mml=8192 KV. Conservative numbers below.
+#
+# This is a SMOKE TEST — not a production recipe. Goal: see where it crashes (or
+# loads), record observations to memory, kill, move on.
+
+# ---- gate: host MemAvailable ----
+HOST_AVAIL_GIB=$(awk '/MemAvailable:/ {print int($2/1024/1024)}' /proc/meminfo)
+echo "Host MemAvailable: ${HOST_AVAIL_GIB} GiB"
+if [ "$HOST_AVAIL_GIB" -lt 10 ]; then
+    echo "MemAvailable ${HOST_AVAIL_GIB} GiB < 10 GiB — free memory or reboot. Abort."
+    exit 1
+fi
+
+# ---- env: scrub oneAPI off LD_LIBRARY_PATH (nosetvars) ----
+export LD_LIBRARY_PATH=$(echo "${LD_LIBRARY_PATH:-}" | tr ':' '\n' | grep -v '/opt/intel/oneapi' | paste -sd: -)
+
+source ~/vllm-v22-venv/bin/activate
+export VLLM_TARGET_DEVICE=xpu
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+# ---- Lunar Lake L0 V1 adapter pin ----
+export SYCL_UR_USE_LEVEL_ZERO_V2=0
+export UR_LOADER_USE_LEVEL_ZERO_V2=0
+export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+
+# ---- persistent JIT caches (v22 dedicated, shared with other v22 launchers) ----
+export SYCL_CACHE_PERSISTENT=1
+export SYCL_CACHE_DIR=${HOME}/.cache/sycl-vllm-xpu-v22
+export NEO_CACHE_PERSISTENT=1
+export NEO_CACHE_DIR=${HOME}/.cache/neo-vllm-xpu-v22
+mkdir -p "$SYCL_CACHE_DIR" "$NEO_CACHE_DIR"
+
+exec vllm serve /shared/models/qwen3.5-35b-a3b-int4-autoround \
+    --served-model-name qwen3.5-35b \
+    --tensor-parallel-size 1 \
+    --gpu-memory-utilization 0.65 \
+    --enforce-eager \
+    --port 8094 \
+    --max-model-len 8192 \
+    --max-num-seqs 1 \
+    --kv-cache-memory-bytes 2000000000 \
+    "$@"
