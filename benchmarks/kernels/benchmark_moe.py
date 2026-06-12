@@ -780,6 +780,7 @@ def get_model_params(config):
         "Qwen2MoeForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",
+        "Lfm2MoeForCausalLM",
     ):
         E = config.num_experts
         topk = config.num_experts_per_tok
