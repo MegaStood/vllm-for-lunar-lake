@@ -10,6 +10,7 @@ from compressed_tensors.quantization import (
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
+    FusedMoE,
     RoutedExperts,
     SharedExperts,
 )
@@ -272,7 +273,7 @@ class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
             w2_g_idx=None,
             w13_g_idx_sort_indices=None,
             w2_g_idx_sort_indices=None,
-            routing_tables=layer._maybe_init_expert_routing_tables(),
+            routing_tables=layer._expert_routing_tables(),
             shared_experts=layer.shared_experts,
         )
 
